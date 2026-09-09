@@ -1,50 +1,70 @@
 // /api/streams
 //
-// Tracks who is *currently* broadcasting, backed by a Redis database so the
-// "Live now" list is real instead of sample data. Requires a Redis database
-// connected to this Vercel project (Storage tab -> Marketplace Database
-// Providers -> Redis -> Create -> Connect Project). That injects the env vars
-// this file reads below.
+// Tracks who is *currently* broadcasting, backed by a Supabase (Postgres)
+// table so the "Live now" list is real instead of sample data.
 //
-// A host's entry expires automatically after TTL_SECONDS unless the client
-// sends a heartbeat, so a stream disappears from the list soon after someone
-// closes the tab without cleanly ending their stream.
+// Setup (Supabase dashboard):
+//   1. Create a project at supabase.com (or use an existing one).
+//   2. SQL Editor -> run the schema in supabase-schema.sql (included alongside
+//      this file) to create the `live_streams` table.
+//   3. Project Settings -> API -> copy:
+//        Project URL           -> SUPABASE_URL
+//        service_role secret   -> SUPABASE_SERVICE_ROLE_KEY
+//      (service_role, NOT the anon/public key — this runs server-side only,
+//      in a Vercel function, so it's safe and lets it bypass RLS.)
+//   4. Add both as environment variables on the Vercel project, then redeploy.
+//
+// A host's row is considered stale after TTL_SECONDS with no heartbeat, so a
+// stream disappears from the list soon after someone closes the tab without
+// cleanly ending their stream. There's no native TTL in Postgres, so GET
+// deletes anything past that age before returning the list.
 //
 //   GET    /api/streams              -> { streams: [{ channel, title, hostName, startedAt }] }
 //   POST   /api/streams   (start/heartbeat, body: { channel, title, hostName })
 //   DELETE /api/streams   (end,             body: { channel })
-import { Redis } from "@upstash/redis";
+import { createClient } from "@supabase/supabase-js";
 
 const TTL_SECONDS = 25;
 
-function getRedis() {
-  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return null;
-  return new Redis({ url, token });
+function getSupabase() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return null;
+  return createClient(url, key, { auth: { persistSession: false } });
 }
 
 export default async function handler(req, res) {
-  const redis = getRedis();
-  if (!redis) {
+  const supabase = getSupabase();
+  if (!supabase) {
     res.status(500).json({
       error:
-        "No Redis database is connected to this project yet. Connect one from the Vercel Storage tab, then redeploy.",
+        "Supabase is not configured on the server. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in this project's Vercel environment variables, then redeploy.",
     });
     return;
   }
 
   if (req.method === "GET") {
-    const channels = (await redis.smembers("live:index")) || [];
-    const entries = await Promise.all(channels.map((ch) => redis.get(`live:${ch}`)));
+    const cutoffIso = new Date(Date.now() - TTL_SECONDS * 1000).toISOString();
 
-    const streams = [];
-    const stale = [];
-    channels.forEach((ch, i) => {
-      if (entries[i]) streams.push({ channel: ch, ...entries[i] });
-      else stale.push(ch);
-    });
-    if (stale.length) await redis.srem("live:index", ...stale);
+    // Sweep stale rows first so the list only ever reflects active streams.
+    await supabase.from("live_streams").delete().lt("updated_at", cutoffIso);
+
+    const { data, error } = await supabase
+      .from("live_streams")
+      .select("channel, title, host_name, started_at")
+      .order("started_at", { ascending: true });
+
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    const streams = (data || []).map((row) => ({
+      channel: row.channel,
+      title: row.title,
+      hostName: row.host_name,
+      startedAt: new Date(row.started_at).getTime(),
+    }));
 
     res.status(200).json({ streams });
     return;
@@ -56,12 +76,28 @@ export default async function handler(req, res) {
       res.status(400).json({ error: "channel is required" });
       return;
     }
-    await redis.set(
-      `live:${channel}`,
-      { title: title || "Live now", hostName: hostName || channel, startedAt: Date.now() },
-      { ex: TTL_SECONDS }
+
+    const nowIso = new Date().toISOString();
+
+    // Upsert: on the very first heartbeat this sets started_at; on later
+    // heartbeats for the same channel, started_at is left alone (see the
+    // schema's trigger) and only updated_at (freshness) moves forward.
+    const { error } = await supabase.from("live_streams").upsert(
+      {
+        channel,
+        title: title || "Live now",
+        host_name: hostName || channel,
+        started_at: nowIso,
+        updated_at: nowIso,
+      },
+      { onConflict: "channel" }
     );
-    await redis.sadd("live:index", channel);
+
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
     res.status(200).json({ ok: true });
     return;
   }
@@ -72,8 +108,13 @@ export default async function handler(req, res) {
       res.status(400).json({ error: "channel is required" });
       return;
     }
-    await redis.del(`live:${channel}`);
-    await redis.srem("live:index", channel);
+
+    const { error } = await supabase.from("live_streams").delete().eq("channel", channel);
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
     res.status(200).json({ ok: true });
     return;
   }
