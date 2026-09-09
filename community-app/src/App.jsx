@@ -354,25 +354,119 @@ function Feed({ user }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Live: real Agora RTC broadcasting.
+// AGORA_APP_ID comes from your Agora App Builder project config. There's no
+// App Certificate set on that project, so this runs in "testing mode" — no
+// token is required to join a channel. That's fine for development, but
+// anyone with the App ID can join any channel by name. Add a token server
+// (Agora has a guide + sample Node server) before real users rely on this.
+//
+// Discovery: the "Live now" list below is still sample data, since knowing
+// who is *currently* broadcasting requires a backend (a database row or
+// Agora RTM presence) that this front-end alone can't provide. The "Join a
+// stream" box lets you jump straight into a real channel by name so you can
+// test host + viewer together (e.g. two browser tabs/devices).
+// ---------------------------------------------------------------------------
+const AGORA_APP_ID = "64162831df204bbe837f04db8b0f0ca7";
+
 function Live({ user }) {
-  const [isLive, setIsLive] = useState(false);
-  const [viewers, setViewers] = useState(1);
+  const [mode, setMode] = useState("browse"); // "browse" | "hosting" | "watching"
+  const [channelInput, setChannelInput] = useState("");
+  const [viewerCount, setViewerCount] = useState(0);
+  const [statusMsg, setStatusMsg] = useState("");
   const [messages, setMessages] = useState([
     { id: 1, name: "kickstands_kenny", text: "let's ride" },
     { id: 2, name: "sadiecross", text: "see you at the ranch" },
   ]);
   const [chatDraft, setChatDraft] = useState("");
+
+  const clientRef = useRef(null);
+  const localTracksRef = useRef(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
   const scrollRef = useRef(null);
 
-  useEffect(() => {
-    if (!isLive) return;
-    const t = setInterval(() => setViewers((v) => v + Math.floor(Math.random() * 3)), 2200);
-    return () => clearInterval(t);
-  }, [isLive]);
+  const myChannel = (user.handle.replace("@", "") || "rider").toLowerCase();
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
+
+  // Always leave the channel and release the camera/mic when this screen unmounts.
+  useEffect(() => () => { cleanup(); }, []);
+
+  const getClient = async () => {
+    if (!clientRef.current) {
+      const AgoraRTC = (await import("agora-rtc-sdk-ng")).default;
+      clientRef.current = { AgoraRTC, client: AgoraRTC.createClient({ mode: "live", codec: "vp8" }) };
+    }
+    return clientRef.current;
+  };
+
+  const cleanup = async () => {
+    localTracksRef.current?.forEach((t) => { t.stop(); t.close(); });
+    localTracksRef.current = null;
+    if (clientRef.current?.client) {
+      clientRef.current.client.removeAllListeners();
+      await clientRef.current.client.leave().catch(() => {});
+    }
+  };
+
+  const goLive = async () => {
+    setStatusMsg("Connecting…");
+    try {
+      const { client } = await getClient();
+      await client.setClientRole("host");
+      const { AgoraRTC } = clientRef.current;
+      const [micTrack, camTrack] = await AgoraRTC.createMicrophoneAndCameraTracks();
+      localTracksRef.current = [micTrack, camTrack];
+
+      client.on("user-joined", () => setViewerCount((v) => v + 1));
+      client.on("user-left", () => setViewerCount((v) => Math.max(0, v - 1)));
+
+      await client.join(AGORA_APP_ID, myChannel, null, null);
+      await client.publish(localTracksRef.current);
+      camTrack.play(localVideoRef.current);
+
+      setMode("hosting");
+      setStatusMsg("");
+    } catch (err) {
+      setStatusMsg("Couldn't go live — " + err.message);
+    }
+  };
+
+  const endLive = async () => {
+    await cleanup();
+    setViewerCount(0);
+    setMode("browse");
+  };
+
+  const joinStream = async (channelName) => {
+    if (!channelName.trim()) return;
+    setStatusMsg("Connecting…");
+    try {
+      const { client } = await getClient();
+      await client.setClientRole("audience");
+
+      client.on("user-published", async (remoteUser, mediaType) => {
+        await client.subscribe(remoteUser, mediaType);
+        if (mediaType === "video") remoteUser.videoTrack?.play(remoteVideoRef.current);
+        if (mediaType === "audio") remoteUser.audioTrack?.play();
+      });
+
+      await client.join(AGORA_APP_ID, channelName.trim().toLowerCase(), null, null);
+      setMode("watching");
+      setStatusMsg("");
+    } catch (err) {
+      setStatusMsg("Couldn't join — " + err.message);
+    }
+  };
+
+  const leaveStream = async () => {
+    await cleanup();
+    setMode("browse");
+  };
 
   const sendChat = () => {
     if (!chatDraft.trim()) return;
@@ -380,26 +474,26 @@ function Live({ user }) {
     setChatDraft("");
   };
 
-  const goLive = () => {
-    setIsLive(true);
-    setViewers(3);
-  };
-  const endLive = () => setIsLive(false);
-
-  if (isLive) {
+  if (mode === "hosting" || mode === "watching") {
+    const isHost = mode === "hosting";
     return (
       <div className="flex flex-col h-full">
         <div
-          className="relative flex items-center justify-center"
-          style={{ background: `radial-gradient(circle at 30% 20%, ${c.surfaceAlt}, ${c.bg})`, height: 200 }}
+          className="relative flex items-center justify-center overflow-hidden"
+          style={{ background: c.bg, height: 200 }}
         >
-          <div className="absolute top-3 left-3 flex items-center gap-2">
+          <div
+            ref={isHost ? localVideoRef : remoteVideoRef}
+            className="absolute inset-0"
+          />
+          <div className="absolute top-3 left-3 flex items-center gap-2 z-10">
             <span style={{ background: c.orange, color: "#1a1105", ...display }} className="text-xs font-semibold px-2 py-1 rounded">Live</span>
-            <span style={{ background: "rgba(0,0,0,0.5)", color: c.text }} className="text-xs px-2 py-1 rounded flex items-center gap-1">
-              <Users size={12} /> {viewers}
-            </span>
+            {isHost && (
+              <span style={{ background: "rgba(0,0,0,0.5)", color: c.text }} className="text-xs px-2 py-1 rounded flex items-center gap-1">
+                <Users size={12} /> {viewerCount}
+              </span>
+            )}
           </div>
-          <Video size={40} style={{ color: c.muted }} />
         </div>
         <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-2">
           {messages.map((m) => (
@@ -420,8 +514,12 @@ function Live({ user }) {
           <button onClick={sendChat} style={{ color: c.steel }}><Send size={18} /></button>
         </div>
         <div className="p-3">
-          <button onClick={endLive} style={{ background: c.surfaceAlt, color: c.orange, ...display }} className="w-full py-2.5 rounded-full text-sm font-medium">
-            End stream
+          <button
+            onClick={isHost ? endLive : leaveStream}
+            style={{ background: c.surfaceAlt, color: c.orange, ...display }}
+            className="w-full py-2.5 rounded-full text-sm font-medium"
+          >
+            {isHost ? "End stream" : "Leave stream"}
           </button>
         </div>
       </div>
@@ -433,15 +531,42 @@ function Live({ user }) {
       <button
         onClick={goLive}
         style={{ background: c.orange, ...display }}
-        className="w-full py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-2 mb-6"
+        className="w-full py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-2 mb-3"
       >
         <Radio size={16} style={{ color: "#1a1105" }} />
         <span style={{ color: "#1a1105" }}>Go live</span>
       </button>
-      <div style={{ color: c.text, ...display }} className="text-sm font-medium mb-3">Live now</div>
+
+      <div className="flex gap-2 mb-2">
+        <input
+          value={channelInput}
+          onChange={(e) => setChannelInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && joinStream(channelInput)}
+          placeholder="Join a stream by rider handle"
+          style={{ background: c.surfaceAlt, color: c.text, ...body }}
+          className="flex-1 rounded-full px-4 py-2 text-sm outline-none"
+        />
+        <button
+          onClick={() => joinStream(channelInput)}
+          style={{ background: c.surfaceAlt, color: c.steel, ...display }}
+          className="px-4 py-2 rounded-full text-sm font-medium"
+        >
+          Join
+        </button>
+      </div>
+      {statusMsg && (
+        <div style={{ color: c.muted, ...body }} className="text-xs mb-4">{statusMsg}</div>
+      )}
+
+      <div style={{ color: c.text, ...display }} className="text-sm font-medium mb-3 mt-4">Live now</div>
       <div className="flex flex-col gap-3">
         {liveStreams.map((s) => (
-          <div key={s.id} className="flex items-center gap-3 p-3 rounded-xl" style={{ background: c.surface, border: `1px solid ${c.border}` }}>
+          <button
+            key={s.id}
+            onClick={() => joinStream(s.name)}
+            className="flex items-center gap-3 p-3 rounded-xl text-left"
+            style={{ background: c.surface, border: `1px solid ${c.border}` }}
+          >
             <div className="relative w-20 h-14 rounded-lg flex items-center justify-center shrink-0" style={{ background: c.surfaceAlt }}>
               <Video size={18} style={{ color: c.muted }} />
               <span style={{ background: c.orange, color: "#1a1105" }} className="absolute top-1 left-1 text-[10px] px-1.5 rounded font-medium">Live</span>
@@ -450,7 +575,7 @@ function Live({ user }) {
               <div style={{ color: c.text, ...display }} className="text-sm font-medium">{s.title}</div>
               <div style={{ color: c.muted }} className="text-xs mt-0.5">{s.name} · {s.viewers} watching</div>
             </div>
-          </div>
+          </button>
         ))}
       </div>
     </div>
