@@ -76,11 +76,19 @@ const initialPosts = [
   },
 ];
 
-const liveStreams = [
-  { id: 1, name: "Route 40 Garage", title: "Panhead carb rebuild, live", viewers: 342 },
-  { id: 2, name: "Sadie Cross", title: "Scouting the Cadillac Ranch route", viewers: 128 },
-  { id: 3, name: "Big R's Shop", title: "Saturday wrench-in & swap meet", viewers: 51 },
-];
+// Fetches a short-lived join token from /api/agora-token so the browser
+// never needs to hold the App Certificate. Throws if the server rejects it
+// (e.g. AGORA_APP_ID / AGORA_APP_CERTIFICATE aren't set yet).
+async function fetchAgoraToken(channel, uid, role) {
+  const res = await fetch(`/api/agora-token?channel=${encodeURIComponent(channel)}&uid=${uid}&role=${role}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Couldn't get a token from the server");
+  return data;
+}
+
+function randomUid() {
+  return Math.floor(Math.random() * 1e8) + 1;
+}
 
 function Avatar({ name, size = 40 }) {
   const initials = name
@@ -372,9 +380,11 @@ const AGORA_APP_ID = "64162831df204bbe837f04db8b0f0ca7";
 
 function Live({ user }) {
   const [mode, setMode] = useState("browse"); // "browse" | "hosting" | "watching"
+  const [streamTitle, setStreamTitle] = useState("");
   const [channelInput, setChannelInput] = useState("");
   const [viewerCount, setViewerCount] = useState(0);
   const [statusMsg, setStatusMsg] = useState("");
+  const [liveList, setLiveList] = useState([]);
   const [messages, setMessages] = useState([
     { id: 1, name: "kickstands_kenny", text: "let's ride" },
     { id: 2, name: "sadiecross", text: "see you at the ranch" },
@@ -386,6 +396,7 @@ function Live({ user }) {
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const scrollRef = useRef(null);
+  const heartbeatRef = useRef(null);
 
   const myChannel = (user.handle.replace("@", "") || "rider").toLowerCase();
 
@@ -393,8 +404,27 @@ function Live({ user }) {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
 
-  // Always leave the channel and release the camera/mic when this screen unmounts.
-  useEffect(() => () => { cleanup(); }, []);
+  // While browsing, poll the presence backend for who's actually live.
+  useEffect(() => {
+    if (mode !== "browse") return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await fetch("/api/streams");
+        const data = await res.json();
+        if (!cancelled) setLiveList(data.streams || []);
+      } catch {
+        // Presence backend may not be connected yet — fail quietly, list stays empty.
+      }
+    };
+    load();
+    const t = setInterval(load, 5000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [mode]);
+
+  // Always leave the channel, release the camera/mic, and stop the heartbeat
+  // when this screen unmounts (e.g. the person switches tabs).
+  useEffect(() => () => { clearInterval(heartbeatRef.current); cleanup(); }, []);
 
   const getClient = async () => {
     if (!clientRef.current) {
@@ -413,21 +443,40 @@ function Live({ user }) {
     }
   };
 
+  const announcePresence = () => {
+    fetch("/api/streams", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        channel: myChannel,
+        title: streamTitle.trim() || `${user.name}'s ride`,
+        hostName: user.name,
+      }),
+    }).catch(() => {});
+  };
+
   const goLive = async () => {
     setStatusMsg("Connecting…");
     try {
       const { client } = await getClient();
       await client.setClientRole("host");
       const { AgoraRTC } = clientRef.current;
+
+      const uid = randomUid();
+      const { token } = await fetchAgoraToken(myChannel, uid, "host");
+
       const [micTrack, camTrack] = await AgoraRTC.createMicrophoneAndCameraTracks();
       localTracksRef.current = [micTrack, camTrack];
 
       client.on("user-joined", () => setViewerCount((v) => v + 1));
       client.on("user-left", () => setViewerCount((v) => Math.max(0, v - 1)));
 
-      await client.join(AGORA_APP_ID, myChannel, null, null);
+      await client.join(AGORA_APP_ID, myChannel, token, uid);
       await client.publish(localTracksRef.current);
       camTrack.play(localVideoRef.current);
+
+      announcePresence();
+      heartbeatRef.current = setInterval(announcePresence, 15000);
 
       setMode("hosting");
       setStatusMsg("");
@@ -437,17 +486,27 @@ function Live({ user }) {
   };
 
   const endLive = async () => {
+    clearInterval(heartbeatRef.current);
+    fetch("/api/streams", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel: myChannel }),
+    }).catch(() => {});
     await cleanup();
     setViewerCount(0);
     setMode("browse");
   };
 
   const joinStream = async (channelName) => {
-    if (!channelName.trim()) return;
+    const name = channelName.trim().toLowerCase();
+    if (!name) return;
     setStatusMsg("Connecting…");
     try {
       const { client } = await getClient();
       await client.setClientRole("audience");
+
+      const uid = randomUid();
+      const { token } = await fetchAgoraToken(name, uid, "audience");
 
       client.on("user-published", async (remoteUser, mediaType) => {
         await client.subscribe(remoteUser, mediaType);
@@ -455,7 +514,7 @@ function Live({ user }) {
         if (mediaType === "audio") remoteUser.audioTrack?.play();
       });
 
-      await client.join(AGORA_APP_ID, channelName.trim().toLowerCase(), null, null);
+      await client.join(AGORA_APP_ID, name, token, uid);
       setMode("watching");
       setStatusMsg("");
     } catch (err) {
@@ -528,6 +587,13 @@ function Live({ user }) {
 
   return (
     <div className="p-4">
+      <input
+        value={streamTitle}
+        onChange={(e) => setStreamTitle(e.target.value)}
+        placeholder="What's this stream about?"
+        style={{ background: c.surfaceAlt, color: c.text, ...body }}
+        className="w-full rounded-full px-4 py-2 text-sm outline-none mb-2"
+      />
       <button
         onClick={goLive}
         style={{ background: c.orange, ...display }}
@@ -559,25 +625,34 @@ function Live({ user }) {
       )}
 
       <div style={{ color: c.text, ...display }} className="text-sm font-medium mb-3 mt-4">Live now</div>
-      <div className="flex flex-col gap-3">
-        {liveStreams.map((s) => (
-          <button
-            key={s.id}
-            onClick={() => joinStream(s.name)}
-            className="flex items-center gap-3 p-3 rounded-xl text-left"
-            style={{ background: c.surface, border: `1px solid ${c.border}` }}
-          >
-            <div className="relative w-20 h-14 rounded-lg flex items-center justify-center shrink-0" style={{ background: c.surfaceAlt }}>
-              <Video size={18} style={{ color: c.muted }} />
-              <span style={{ background: c.orange, color: "#1a1105" }} className="absolute top-1 left-1 text-[10px] px-1.5 rounded font-medium">Live</span>
-            </div>
-            <div className="flex-1">
-              <div style={{ color: c.text, ...display }} className="text-sm font-medium">{s.title}</div>
-              <div style={{ color: c.muted }} className="text-xs mt-0.5">{s.name} · {s.viewers} watching</div>
-            </div>
-          </button>
-        ))}
-      </div>
+      {liveList.length === 0 ? (
+        <div
+          style={{ background: c.surface, border: `1px solid ${c.border}`, color: c.muted, ...body }}
+          className="text-sm p-4 rounded-xl text-center"
+        >
+          No one's riding live right now. Be the first.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {liveList.map((s) => (
+            <button
+              key={s.channel}
+              onClick={() => joinStream(s.channel)}
+              className="flex items-center gap-3 p-3 rounded-xl text-left"
+              style={{ background: c.surface, border: `1px solid ${c.border}` }}
+            >
+              <div className="relative w-20 h-14 rounded-lg flex items-center justify-center shrink-0" style={{ background: c.surfaceAlt }}>
+                <Video size={18} style={{ color: c.muted }} />
+                <span style={{ background: c.orange, color: "#1a1105" }} className="absolute top-1 left-1 text-[10px] px-1.5 rounded font-medium">Live</span>
+              </div>
+              <div className="flex-1">
+                <div style={{ color: c.text, ...display }} className="text-sm font-medium">{s.title}</div>
+                <div style={{ color: c.muted }} className="text-xs mt-0.5">{s.hostName}</div>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
