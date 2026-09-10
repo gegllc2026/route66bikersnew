@@ -501,6 +501,19 @@ function Live({ user }) {
   // when this screen unmounts (e.g. the person switches tabs).
   useEffect(() => () => { clearInterval(heartbeatRef.current); cleanup(); }, []);
 
+  // The local video container only exists in the DOM once `mode` is
+  // "hosting" (it's rendered in the JSX below). goLive() creates and
+  // publishes the camera track *before* that render happens, so calling
+  // camTrack.play() at that point has nowhere to attach to. Instead, play
+  // it here, after React has actually mounted the video element.
+  useEffect(() => {
+    if (mode !== "hosting") return;
+    const camTrack = localTracksRef.current?.[1];
+    if (camTrack && localVideoRef.current) {
+      camTrack.play(localVideoRef.current);
+    }
+  }, [mode]);
+
   const getClient = async () => {
     if (!clientRef.current) {
       const AgoraRTC = (await import("agora-rtc-sdk-ng")).default;
@@ -549,7 +562,8 @@ function Live({ user }) {
 
       await client.join(AGORA_APP_ID, myChannel, token, uid);
       await client.publish(localTracksRef.current);
-      camTrack.play(localVideoRef.current);
+      // Video is attached in the useEffect above once `mode` becomes
+      // "hosting" and the video element actually exists in the DOM.
 
       announcePresence();
       heartbeatRef.current = setInterval(announcePresence, 15000);
