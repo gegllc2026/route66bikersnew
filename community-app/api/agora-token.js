@@ -15,7 +15,13 @@
 //
 // Request:  GET /api/agora-token?channel=<name>&uid=<number>&role=host|audience
 // Response: { token, appId, channel, uid }
-import { RtcTokenBuilder, RtcRole } from "agora-token";
+// NOTE: agora-token is a CommonJS package. Importing { RtcTokenBuilder,
+// RtcRole } directly fails under Node's ESM interop (it can't statically
+// detect those named exports on this package), which crashes the whole
+// function at load time before any of our code even runs. Importing the
+// default export and destructuring at runtime avoids that.
+import agoraToken from "agora-token";
+const { RtcTokenBuilder, RtcRole } = agoraToken;
 import { getAuthedProfile } from "./_lib/authHelpers.js";
 
 const TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
