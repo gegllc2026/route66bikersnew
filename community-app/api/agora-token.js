@@ -21,53 +21,75 @@ import { getAuthedProfile } from "./_lib/authHelpers.js";
 const TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 
 export default async function handler(req, res) {
-  if (req.method !== "GET") {
-    res.status(405).json({ error: "Method not allowed" });
-    return;
-  }
+  // Everything below is wrapped so a thrown error (bad env var, Supabase
+  // hiccup, etc.) always comes back as a JSON message instead of a bare,
+  // bodyless 500 that just says "Internal Server Error" in the browser.
+  try {
+    if (req.method !== "GET") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
 
-  const { channel, uid, role } = req.query;
+    const { channel, uid, role } = req.query;
 
-  if (!channel) {
-    res.status(400).json({ error: "channel is required" });
-    return;
-  }
+    if (!channel) {
+      res.status(400).json({ error: "channel is required" });
+      return;
+    }
 
-  const profile = await getAuthedProfile(req);
-  if (!profile) {
-    res.status(401).json({ error: "Sign in required." });
-    return;
-  }
+    let profile;
+    try {
+      profile = await getAuthedProfile(req);
+    } catch (authErr) {
+      console.error("agora-token: getAuthedProfile threw", authErr);
+      res.status(500).json({
+        error: "Could not verify your session (Supabase lookup failed).",
+        detail: authErr?.message || String(authErr),
+      });
+      return;
+    }
 
-  const wantsHost = role !== "audience";
-  if (wantsHost && profile.role !== "biker") {
-    res.status(403).json({ error: "Only biker accounts can go live." });
-    return;
-  }
+    if (!profile) {
+      res.status(401).json({ error: "Sign in required." });
+      return;
+    }
 
-  const appId = process.env.AGORA_APP_ID;
-  const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+    const wantsHost = role !== "audience";
+    if (wantsHost && profile.role !== "biker") {
+      res.status(403).json({ error: "Only biker accounts can go live." });
+      return;
+    }
 
-  if (!appId || !appCertificate) {
+    const appId = process.env.AGORA_APP_ID;
+    const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+
+    if (!appId || !appCertificate) {
+      res.status(500).json({
+        error:
+          "Agora credentials are not configured on the server. Set AGORA_APP_ID and AGORA_APP_CERTIFICATE in this project's Vercel environment variables (Production scope), then redeploy.",
+      });
+      return;
+    }
+
+    const numericUid = Number(uid) || 0;
+    const rtcRole = wantsHost ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      appId,
+      appCertificate,
+      channel,
+      numericUid,
+      rtcRole,
+      TOKEN_LIFETIME_SECONDS,
+      TOKEN_LIFETIME_SECONDS
+    );
+
+    res.status(200).json({ token, appId, channel, uid: numericUid });
+  } catch (err) {
+    console.error("agora-token: unhandled error", err);
     res.status(500).json({
-      error:
-        "Agora credentials are not configured on the server. Set AGORA_APP_ID and AGORA_APP_CERTIFICATE in this project's Vercel environment variables, then redeploy.",
+      error: "Unexpected server error while generating the Agora token.",
+      detail: err?.message || String(err),
     });
-    return;
   }
-
-  const numericUid = Number(uid) || 0;
-  const rtcRole = wantsHost ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
-
-  const token = RtcTokenBuilder.buildTokenWithUid(
-    appId,
-    appCertificate,
-    channel,
-    numericUid,
-    rtcRole,
-    TOKEN_LIFETIME_SECONDS,
-    TOKEN_LIFETIME_SECONDS
-  );
-
-  res.status(200).json({ token, appId, channel, uid: numericUid });
 }
