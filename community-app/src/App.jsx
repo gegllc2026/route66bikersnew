@@ -21,7 +21,7 @@ import {
   MapPin,
 } from "lucide-react";
 import logo from "./assets/logo.png";
-import { supabase } from "./supabaseClient";
+import { supabase, supabaseConfigured } from "./supabaseClient";
 import { fetchProfile, authHeader } from "./authHelpers";
 
 // ---------------------------------------------------------------------------
@@ -826,6 +826,25 @@ export default function App() {
   const [checkingSession, setCheckingSession] = useState(true);
   const [tab, setTab] = useState("feed");
   const titles = { feed: "Community", live: "Live", profile: "Profile" };
+
+  // Fail loud and visible instead of a blank screen: this only happens if
+  // VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY weren't set at build time.
+  if (!supabaseConfigured) {
+    return (
+      <div
+        style={{ background: c.bg, color: c.text, ...body }}
+        className="w-full max-w-md mx-auto flex flex-col items-center justify-center text-center p-8 rounded-2xl overflow-hidden"
+      >
+        <div style={{ height: 640 }} className="flex flex-col items-center justify-center gap-3">
+          <div style={{ ...display }} className="text-lg font-semibold">Setup incomplete</div>
+          <div style={{ color: c.muted }} className="text-sm max-w-xs">
+            VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY aren't set for this build. Add them in
+            Vercel's Environment Variables, then redeploy.
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // On load, pick up an existing Supabase session (so a refresh doesn't log
   // people out), and keep listening for sign-outs (e.g. a token expiring).
