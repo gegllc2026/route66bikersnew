@@ -1,18 +1,26 @@
 // /api/agora-token
 //
 // Generates a short-lived Agora RTC token so the browser never needs to know
-// your App Certificate. Requires two environment variables to be set on the
-// Vercel project (Settings -> Environment Variables):
+// your App Certificate. Requires two environment variables on the Vercel
+// project (Settings -> Environment Variables):
 //   AGORA_APP_ID           - same App ID already used on the front end
 //   AGORA_APP_CERTIFICATE  - from Agora Console -> your project -> Certificate
+//
+// Every request must include the caller's Supabase session token:
+//   Authorization: Bearer <access_token>
+// Host tokens (role=host, i.e. going live) are only issued to accounts whose
+// profile role is "biker" — this is the actual enforcement point for
+// "only bikers can go live"; the UI hiding the button is just a courtesy.
+// Audience tokens (role=audience) are issued to any signed-in account.
 //
 // Request:  GET /api/agora-token?channel=<name>&uid=<number>&role=host|audience
 // Response: { token, appId, channel, uid }
 import { RtcTokenBuilder, RtcRole } from "agora-token";
+import { getAuthedProfile } from "./_lib/authHelpers.js";
 
 const TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 
-export default function handler(req, res) {
+export default async function handler(req, res) {
   if (req.method !== "GET") {
     res.status(405).json({ error: "Method not allowed" });
     return;
@@ -22,6 +30,18 @@ export default function handler(req, res) {
 
   if (!channel) {
     res.status(400).json({ error: "channel is required" });
+    return;
+  }
+
+  const profile = await getAuthedProfile(req);
+  if (!profile) {
+    res.status(401).json({ error: "Sign in required." });
+    return;
+  }
+
+  const wantsHost = role !== "audience";
+  if (wantsHost && profile.role !== "biker") {
+    res.status(403).json({ error: "Only biker accounts can go live." });
     return;
   }
 
@@ -37,7 +57,7 @@ export default function handler(req, res) {
   }
 
   const numericUid = Number(uid) || 0;
-  const rtcRole = role === "audience" ? RtcRole.SUBSCRIBER : RtcRole.PUBLISHER;
+  const rtcRole = wantsHost ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
 
   const token = RtcTokenBuilder.buildTokenWithUid(
     appId,

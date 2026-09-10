@@ -3,16 +3,14 @@
 // Tracks who is *currently* broadcasting, backed by a Supabase (Postgres)
 // table so the "Live now" list is real instead of sample data.
 //
-// Setup (Supabase dashboard):
-//   1. Create a project at supabase.com (or use an existing one).
-//   2. SQL Editor -> run the schema in supabase-schema.sql (included alongside
-//      this file) to create the `live_streams` table.
-//   3. Project Settings -> API -> copy:
-//        Project URL           -> SUPABASE_URL
-//        service_role secret   -> SUPABASE_SERVICE_ROLE_KEY
-//      (service_role, NOT the anon/public key — this runs server-side only,
-//      in a Vercel function, so it's safe and lets it bypass RLS.)
-//   4. Add both as environment variables on the Vercel project, then redeploy.
+// GET is public (anyone browsing can see who's live). POST (start/heartbeat)
+// and DELETE (end) require a signed-in caller via:
+//   Authorization: Bearer <access_token>
+// POST additionally requires the caller's profile role to be "biker" — this,
+// together with the same check in api/agora-token.js, is what actually
+// enforces "only bikers can go live" (server-side, not just a hidden button).
+// Both POST and DELETE also confirm the caller owns the channel (host_id
+// matches their account), so one rider can't end or hijack another's stream.
 //
 // A host's row is considered stale after TTL_SECONDS with no heartbeat, so a
 // stream disappears from the list soon after someone closes the tab without
@@ -23,6 +21,7 @@
 //   POST   /api/streams   (start/heartbeat, body: { channel, title, hostName })
 //   DELETE /api/streams   (end,             body: { channel })
 import { createClient } from "@supabase/supabase-js";
+import { getAuthedProfile } from "./_lib/authHelpers.js";
 
 const TTL_SECONDS = 25;
 
@@ -77,6 +76,28 @@ export default async function handler(req, res) {
       return;
     }
 
+    const profile = await getAuthedProfile(req);
+    if (!profile) {
+      res.status(401).json({ error: "Sign in required." });
+      return;
+    }
+    if (profile.role !== "biker") {
+      res.status(403).json({ error: "Only biker accounts can go live." });
+      return;
+    }
+
+    // If the channel is already live under someone else's account, don't
+    // let this request steal or overwrite it.
+    const { data: existing } = await supabase
+      .from("live_streams")
+      .select("host_id")
+      .eq("channel", channel)
+      .maybeSingle();
+    if (existing && existing.host_id && existing.host_id !== profile.id) {
+      res.status(403).json({ error: "That channel is already live under another account." });
+      return;
+    }
+
     const nowIso = new Date().toISOString();
 
     // Upsert: on the very first heartbeat this sets started_at; on later
@@ -87,6 +108,7 @@ export default async function handler(req, res) {
         channel,
         title: title || "Live now",
         host_name: hostName || channel,
+        host_id: profile.id,
         started_at: nowIso,
         updated_at: nowIso,
       },
@@ -106,6 +128,22 @@ export default async function handler(req, res) {
     const { channel } = req.body || {};
     if (!channel) {
       res.status(400).json({ error: "channel is required" });
+      return;
+    }
+
+    const profile = await getAuthedProfile(req);
+    if (!profile) {
+      res.status(401).json({ error: "Sign in required." });
+      return;
+    }
+
+    const { data: existing } = await supabase
+      .from("live_streams")
+      .select("host_id")
+      .eq("channel", channel)
+      .maybeSingle();
+    if (existing && existing.host_id && existing.host_id !== profile.id) {
+      res.status(403).json({ error: "You can only end your own stream." });
       return;
     }
 

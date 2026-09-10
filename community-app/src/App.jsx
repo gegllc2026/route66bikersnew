@@ -21,6 +21,8 @@ import {
   MapPin,
 } from "lucide-react";
 import logo from "./assets/logo.png";
+import { supabase } from "./supabaseClient";
+import { fetchProfile, authHeader } from "./authHelpers";
 
 // ---------------------------------------------------------------------------
 // Route 66 Bikers — design tokens
@@ -80,7 +82,10 @@ const initialPosts = [
 // never needs to hold the App Certificate. Throws if the server rejects it
 // (e.g. AGORA_APP_ID / AGORA_APP_CERTIFICATE aren't set yet).
 async function fetchAgoraToken(channel, uid, role) {
-  const res = await fetch(`/api/agora-token?channel=${encodeURIComponent(channel)}&uid=${uid}&role=${role}`);
+  const headers = await authHeader();
+  const res = await fetch(`/api/agora-token?channel=${encodeURIComponent(channel)}&uid=${uid}&role=${role}`, {
+    headers,
+  });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Couldn't get a token from the server");
   return data;
@@ -122,15 +127,20 @@ function Avatar({ name, size = 40 }) {
 function AuthScreen({ onAuthed }) {
   const [mode, setMode] = useState("login"); // "login" | "signup"
   const [name, setName] = useState("");
+  const [role, setRole] = useState("fan"); // "biker" | "fan" — only set at signup
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   const isSignup = mode === "signup";
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
+    setError("");
+    setInfo("");
     if (isSignup && !name.trim()) {
       setError("Tell us what to call you.");
       return;
@@ -139,12 +149,38 @@ function AuthScreen({ onAuthed }) {
       setError("Email and password are both required.");
       return;
     }
-    setError("");
-    const displayName = isSignup ? name.trim() : email.split("@")[0];
-    onAuthed({
-      name: displayName || "Rider",
-      handle: "@" + (displayName || "rider").toLowerCase().replace(/[^a-z0-9]/g, ""),
-    });
+
+    setSubmitting(true);
+    try {
+      if (isSignup) {
+        const handle = "@" + name.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+          options: { data: { name: name.trim(), handle, role } },
+        });
+        if (signUpError) throw signUpError;
+
+        if (!data.session) {
+          // Email confirmation is on for this project — no session yet.
+          setInfo("Account created — check your email to confirm it, then log in.");
+          setMode("login");
+          return;
+        }
+        onAuthed(await fetchProfile(data.user.id));
+      } else {
+        const { data, error: signInError } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        });
+        if (signInError) throw signInError;
+        onAuthed(await fetchProfile(data.user.id));
+      }
+    } catch (err) {
+      setError(err.message || "Something went wrong.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -209,6 +245,39 @@ function AuthScreen({ onAuthed }) {
           </label>
         )}
 
+        {isSignup && (
+          <div className="flex flex-col gap-1.5">
+            <span style={{ color: c.muted, ...body }} className="text-xs">
+              Account type
+            </span>
+            <div className="flex rounded-full p-1" style={{ background: c.surfaceAlt }}>
+              {[
+                ["biker", "Biker"],
+                ["fan", "Biker Fan"],
+              ].map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setRole(key)}
+                  style={{
+                    background: role === key ? c.steel : "transparent",
+                    color: role === key ? "#0B1420" : c.muted,
+                    ...display,
+                  }}
+                  className="flex-1 py-2 rounded-full text-sm font-medium transition-colors"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <span style={{ color: c.muted, ...body }} className="text-xs">
+              {role === "biker"
+                ? "Bikers can post rides and go live."
+                : "Fans can post, watch streams, and chat — going live is for bikers."}
+            </span>
+          </div>
+        )}
+
         <label className="flex flex-col gap-1.5">
           <span style={{ color: c.muted, ...body }} className="text-xs">
             Email
@@ -261,14 +330,20 @@ function AuthScreen({ onAuthed }) {
             {error}
           </div>
         )}
+        {info && (
+          <div style={{ color: c.steel, ...body }} className="text-xs">
+            {info}
+          </div>
+        )}
 
         <button
           type="submit"
-          style={{ background: c.orange, color: "#1a1105", ...display }}
+          disabled={submitting}
+          style={{ background: c.orange, color: "#1a1105", ...display, opacity: submitting ? 0.7 : 1 }}
           className="w-full py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-2 mt-2"
         >
           {isSignup ? <UserPlus size={16} /> : <LogIn size={16} />}
-          {isSignup ? "Create account" : "Log in"}
+          {submitting ? "Please wait…" : isSignup ? "Create account" : "Log in"}
         </button>
       </form>
 
@@ -443,10 +518,11 @@ function Live({ user }) {
     }
   };
 
-  const announcePresence = () => {
+  const announcePresence = async () => {
+    const headers = { "Content-Type": "application/json", ...(await authHeader()) };
     fetch("/api/streams", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({
         channel: myChannel,
         title: streamTitle.trim() || `${user.name}'s ride`,
@@ -487,9 +563,10 @@ function Live({ user }) {
 
   const endLive = async () => {
     clearInterval(heartbeatRef.current);
+    const headers = { "Content-Type": "application/json", ...(await authHeader()) };
     fetch("/api/streams", {
       method: "DELETE",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ channel: myChannel }),
     }).catch(() => {});
     await cleanup();
@@ -587,21 +664,32 @@ function Live({ user }) {
 
   return (
     <div className="p-4">
-      <input
-        value={streamTitle}
-        onChange={(e) => setStreamTitle(e.target.value)}
-        placeholder="What's this stream about?"
-        style={{ background: c.surfaceAlt, color: c.text, ...body }}
-        className="w-full rounded-full px-4 py-2 text-sm outline-none mb-2"
-      />
-      <button
-        onClick={goLive}
-        style={{ background: c.orange, ...display }}
-        className="w-full py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-2 mb-3"
-      >
-        <Radio size={16} style={{ color: "#1a1105" }} />
-        <span style={{ color: "#1a1105" }}>Go live</span>
-      </button>
+      {user.role === "biker" ? (
+        <>
+          <input
+            value={streamTitle}
+            onChange={(e) => setStreamTitle(e.target.value)}
+            placeholder="What's this stream about?"
+            style={{ background: c.surfaceAlt, color: c.text, ...body }}
+            className="w-full rounded-full px-4 py-2 text-sm outline-none mb-2"
+          />
+          <button
+            onClick={goLive}
+            style={{ background: c.orange, ...display }}
+            className="w-full py-3 rounded-full text-sm font-semibold flex items-center justify-center gap-2 mb-3"
+          >
+            <Radio size={16} style={{ color: "#1a1105" }} />
+            <span style={{ color: "#1a1105" }}>Go live</span>
+          </button>
+        </>
+      ) : (
+        <div
+          style={{ background: c.surface, border: `1px solid ${c.border}`, color: c.muted, ...body }}
+          className="text-sm p-3 rounded-xl text-center mb-3"
+        >
+          Going live is for biker accounts. You can watch and chat in any stream below.
+        </div>
+      )}
 
       <div className="flex gap-2 mb-2">
         <input
@@ -692,7 +780,15 @@ function Profile({ user, onSignOut }) {
       ) : (
         <div className="mt-4">
           <div style={{ color: c.text, ...display }} className="text-lg font-semibold">{name}</div>
-          <div style={{ color: c.muted, ...body }} className="text-xs mt-0.5">{user.handle}</div>
+          <div className="flex items-center gap-2 mt-0.5">
+            <span style={{ color: c.muted, ...body }} className="text-xs">{user.handle}</span>
+            <span
+              style={{ background: c.surfaceAlt, color: user.role === "biker" ? c.orange : c.steel, ...display }}
+              className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wide"
+            >
+              {user.role === "biker" ? "Biker" : "Biker Fan"}
+            </span>
+          </div>
           <p style={{ color: c.muted, ...body }} className="text-sm mt-2 leading-relaxed">{bio}</p>
         </div>
       )}
@@ -727,8 +823,54 @@ function Profile({ user, onSignOut }) {
 
 export default function App() {
   const [user, setUser] = useState(null);
+  const [checkingSession, setCheckingSession] = useState(true);
   const [tab, setTab] = useState("feed");
   const titles = { feed: "Community", live: "Live", profile: "Profile" };
+
+  // On load, pick up an existing Supabase session (so a refresh doesn't log
+  // people out), and keep listening for sign-outs (e.g. a token expiring).
+  useEffect(() => {
+    let cancelled = false;
+
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (session?.user) {
+        try {
+          const profile = await fetchProfile(session.user.id);
+          if (!cancelled) setUser(profile);
+        } catch {
+          // Profile row not ready yet or query failed — fall back to signed-out.
+        }
+      }
+      if (!cancelled) setCheckingSession(false);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((event) => {
+      if (event === "SIGNED_OUT") setUser(null);
+    });
+
+    return () => {
+      cancelled = true;
+      sub.subscription.unsubscribe();
+    };
+  }, []);
+
+  const signOut = async () => {
+    await supabase.auth.signOut();
+    setUser(null);
+  };
+
+  if (checkingSession) {
+    return (
+      <div
+        style={{ background: c.bg, color: c.muted, ...body }}
+        className="w-full max-w-md mx-auto flex items-center justify-center rounded-2xl overflow-hidden"
+      >
+        <div style={{ height: 640 }} className="flex items-center justify-center w-full text-sm">
+          Loading…
+        </div>
+      </div>
+    );
+  }
 
   const frame = (
     <div style={{ background: c.bg, ...body }} className="w-full max-w-md mx-auto flex flex-col rounded-2xl overflow-hidden">
@@ -752,7 +894,7 @@ export default function App() {
           <div className="flex-1 overflow-y-auto" style={{ height: 560 }}>
             {tab === "feed" && <Feed user={user} />}
             {tab === "live" && <Live user={user} />}
-            {tab === "profile" && <Profile user={user} onSignOut={() => setUser(null)} />}
+            {tab === "profile" && <Profile user={user} onSignOut={signOut} />}
           </div>
           <div className="flex border-t" style={{ borderColor: c.border, background: c.surface }}>
             {[["feed", Home], ["live", Radio], ["profile", User]].map(([key, Icon]) => (
