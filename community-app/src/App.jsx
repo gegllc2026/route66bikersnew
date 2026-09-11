@@ -470,6 +470,7 @@ function Live({ user }) {
   const localTracksRef = useRef(null);
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
+  const remoteVideoTrackRef = useRef(null);
   const scrollRef = useRef(null);
   const heartbeatRef = useRef(null);
 
@@ -514,6 +515,17 @@ function Live({ user }) {
     }
   }, [mode]);
 
+  // Same issue as the host preview above: a host who is already live can
+  // publish before the "watching" screen (and remoteVideoRef) has mounted,
+  // so playing directly inside the event handler can fire too early. Stash
+  // the track and (re)play it here once the video element actually exists.
+  useEffect(() => {
+    if (mode !== "watching") return;
+    if (remoteVideoTrackRef.current && remoteVideoRef.current) {
+      remoteVideoTrackRef.current.play(remoteVideoRef.current);
+    }
+  }, [mode]);
+
   const getClient = async () => {
     if (!clientRef.current) {
       const AgoraRTC = (await import("agora-rtc-sdk-ng")).default;
@@ -525,6 +537,7 @@ function Live({ user }) {
   const cleanup = async () => {
     localTracksRef.current?.forEach((t) => { t.stop(); t.close(); });
     localTracksRef.current = null;
+    remoteVideoTrackRef.current = null;
     if (clientRef.current?.client) {
       clientRef.current.client.removeAllListeners();
       await clientRef.current.client.leave().catch(() => {});
@@ -601,7 +614,12 @@ function Live({ user }) {
 
       client.on("user-published", async (remoteUser, mediaType) => {
         await client.subscribe(remoteUser, mediaType);
-        if (mediaType === "video") remoteUser.videoTrack?.play(remoteVideoRef.current);
+        if (mediaType === "video") {
+          remoteVideoTrackRef.current = remoteUser.videoTrack;
+          // Try to play immediately in case the video element is already
+          // mounted; if not, the useEffect above catches it once it is.
+          if (remoteVideoRef.current) remoteUser.videoTrack?.play(remoteVideoRef.current);
+        }
         if (mediaType === "audio") remoteUser.audioTrack?.play();
       });
 
